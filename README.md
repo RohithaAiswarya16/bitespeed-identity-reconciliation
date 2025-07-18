@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Bitespeed Identity Reconciliation Backend
 
 A Node.js/TypeScript backend service for identity reconciliation that links customer contacts across multiple purchases using email and phone number matching.
@@ -157,3 +158,6 @@ The SQLite database file will be created automatically in the `data/` directory.
 - Add contact merge conflict resolution
 - Implement contact splitting functionality
 - Add comprehensive audit logging
+=======
+# bitespeed-identity-reconciliation
+>>>>>>> af5c075074c720550dce36902fe17a1f4600ab8f
