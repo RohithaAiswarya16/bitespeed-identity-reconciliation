@@ -11,83 +11,89 @@ class ContactService {
   async identifyContact(request: IdentifyRequest): Promise<IdentifyResponse> {
     const { email, phoneNumber } = request;
 
-    // Find existing contacts with matching email or phone number
     const existingContacts = await this.findExistingContacts(email, phoneNumber);
 
     if (existingContacts.length === 0) {
-      // No existing contacts, create a new primary contact
       const newContact = await this.createNewContact(email, phoneNumber, 'primary');
       return this.buildResponse([newContact]);
     }
+    
+    // Using a Set to get unique contacts based on ID
+    const uniqueExistingContacts = [...new Map(existingContacts.map(c => [c.id, c])).values()];
 
-    // Check if we need to create a new secondary contact
-    const needsNewContact = this.shouldCreateNewContact(existingContacts, email, phoneNumber);
+    const needsNewContact = this.shouldCreateNewContact(uniqueExistingContacts, email, phoneNumber);
     
     if (needsNewContact) {
-      // Find the primary contact to link to
-      const primaryContact = await this.findPrimaryContact(existingContacts);
+      const primaryContact = await this.findPrimaryContact(uniqueExistingContacts);
       const newContact = await this.createNewContact(email, phoneNumber, 'secondary', primaryContact.id);
-      existingContacts.push(newContact);
+      uniqueExistingContacts.push(newContact);
     }
 
-    // Handle linking of separate contact chains
-    await this.linkContactChains(existingContacts);
+    await this.linkContactChains(uniqueExistingContacts);
 
-    // Get all contacts in the consolidated chain
-    const allContacts = await this.getAllLinkedContacts(existingContacts);
+    const allContacts = await this.getAllLinkedContacts(uniqueExistingContacts);
 
     return this.buildResponse(allContacts);
   }
 
   private async findExistingContacts(email?: string, phoneNumber?: string): Promise<Contact[]> {
-    const conditions = [];
-    const params = [];
-
-    if (email) {
-      conditions.push('email = ?');
-      params.push(email);
-    }
-
-    if (phoneNumber) {
-      conditions.push('phoneNumber = ?');
-      params.push(phoneNumber);
-    }
-
-    if (conditions.length === 0) {
+    if (!email && !phoneNumber) {
       return [];
     }
-
-    const query = `
+    
+    // First, find initial matches
+    const initialMatches = await this.db.all(`
       SELECT * FROM Contact 
-      WHERE deletedAt IS NULL AND (${conditions.join(' OR ')})
+      WHERE deletedAt IS NULL AND (${[email && 'email = ?', phoneNumber && 'phoneNumber = ?'].filter(Boolean).join(' OR ')})
       ORDER BY createdAt ASC
-    `;
+    `, [email, phoneNumber].filter(Boolean));
 
-    return await this.db.all(query, params);
+    if (initialMatches.length === 0) {
+        return [];
+    }
+
+    // Now, find all contacts linked to the initial matches
+    const linkedIds = new Set<number>();
+    initialMatches.forEach(c => {
+        if(c.linkedId) linkedIds.add(c.linkedId);
+        if(c.linkPrecedence === 'primary') linkedIds.add(c.id);
+    });
+
+    const allRelatedContacts = await this.db.all(`
+      SELECT * FROM Contact 
+      WHERE deletedAt IS NULL AND (id IN (${Array.from(linkedIds).map(() => '?').join(',')}) OR linkedId IN (${Array.from(linkedIds).map(() => '?').join(',')}))
+      ORDER BY createdAt ASC
+    `, [...linkedIds, ...linkedIds]);
+    
+    return allRelatedContacts;
   }
 
   private shouldCreateNewContact(existingContacts: Contact[], email?: string, phoneNumber?: string): boolean {
-    // Check if this exact combination already exists
-    return !existingContacts.some(contact => 
-      contact.email === email && contact.phoneNumber === phoneNumber
-    );
+    const hasEmail = email ? existingContacts.some(c => c.email === email) : true;
+    const hasPhoneNumber = phoneNumber ? existingContacts.some(c => c.phoneNumber === phoneNumber) : true;
+    return !hasEmail || !hasPhoneNumber;
   }
 
+  // FIX: This function now correctly handles the case where a contact might not be found.
   private async findPrimaryContact(contacts: Contact[]): Promise<Contact> {
-    // Find the oldest primary contact
-    let primaryContact = contacts.find(c => c.linkPrecedence === 'primary');
-    
+    // Find the oldest contact, which will be the primary or linked to the primary
+    const oldestContact = contacts[0];
+    if (!oldestContact) {
+      throw new Error("Could not find a primary contact from an empty list.");
+    }
+
+    if (oldestContact.linkPrecedence === 'primary') {
+      return oldestContact;
+    }
+
+    // If the oldest contact is secondary, find its primary
+    const primaryContact = await this.db.get(
+      'SELECT * FROM Contact WHERE id = ? AND deletedAt IS NULL',
+      [oldestContact.linkedId]
+    );
+
     if (!primaryContact) {
-      // If no primary found, get the primary of the first contact
-      const firstContact = contacts[0];
-      if (firstContact.linkedId) {
-        primaryContact = await this.db.get(
-          'SELECT * FROM Contact WHERE id = ? AND deletedAt IS NULL',
-          [firstContact.linkedId]
-        );
-      } else {
-        primaryContact = firstContact;
-      }
+      throw new Error(`Could not find primary contact with ID ${oldestContact.linkedId}`);
     }
 
     return primaryContact;
@@ -113,61 +119,30 @@ class ContactService {
   }
 
   private async linkContactChains(contacts: Contact[]): Promise<void> {
-    if (contacts.length <= 1) return;
-
-    // Group contacts by their primary contact
-    const chains = new Map<number, Contact[]>();
+    const primaryContacts = contacts.filter(c => c.linkPrecedence === 'primary');
     
-    for (const contact of contacts) {
-      const primaryId = contact.linkPrecedence === 'primary' ? contact.id : contact.linkedId;
-      if (!chains.has(primaryId)) {
-        chains.set(primaryId, []);
-      }
-      chains.get(primaryId)!.push(contact);
-    }
+    // If there's one or zero primary contacts, no merging is needed
+    if (primaryContacts.length <= 1) return;
 
-    if (chains.size <= 1) return;
+    // The first one in the sorted list is the oldest
+    const oldestPrimary = primaryContacts[0];
+    const otherPrimaryContacts = primaryContacts.slice(1);
+    const idsToDemote = otherPrimaryContacts.map(c => c.id);
 
-    // Find the oldest primary contact
-    const primaryContacts = Array.from(chains.keys()).map(id => 
-      contacts.find(c => c.id === id && c.linkPrecedence === 'primary')
-    ).filter(Boolean) as Contact[];
-
-    const oldestPrimary = primaryContacts.reduce((oldest, current) => 
-      new Date(current.createdAt) < new Date(oldest.createdAt) ? current : oldest
-    );
-
-    // Convert other primary contacts to secondary
-    for (const [primaryId, chainContacts] of chains) {
-      if (primaryId !== oldestPrimary.id) {
-        // Update the primary contact to secondary
-        await this.db.run(`
-          UPDATE Contact 
-          SET linkPrecedence = 'secondary', linkedId = ?, updatedAt = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `, [oldestPrimary.id, primaryId]);
-
-        // Update all secondary contacts in this chain
-        for (const contact of chainContacts) {
-          if (contact.linkPrecedence === 'secondary') {
-            await this.db.run(`
-              UPDATE Contact 
-              SET linkedId = ?, updatedAt = CURRENT_TIMESTAMP
-              WHERE id = ?
-            `, [oldestPrimary.id, contact.id]);
-          }
-        }
-      }
-    }
+    // Demote other primary contacts to secondary
+    await this.db.run(`
+      UPDATE Contact 
+      SET linkPrecedence = 'secondary', linkedId = ?, updatedAt = CURRENT_TIMESTAMP
+      WHERE id IN (${idsToDemote.map(() => '?').join(',')})
+    `, [oldestPrimary.id, ...idsToDemote]);
   }
 
+  // FIX: This function now correctly handles the result from the fixed findPrimaryContact
   private async getAllLinkedContacts(contacts: Contact[]): Promise<Contact[]> {
     if (contacts.length === 0) return [];
 
-    // Find the primary contact
     const primaryContact = await this.findPrimaryContact(contacts);
 
-    // Get all contacts linked to this primary
     const allLinkedContacts = await this.db.all(`
       SELECT * FROM Contact 
       WHERE deletedAt IS NULL AND (id = ? OR linkedId = ?)
@@ -176,41 +151,26 @@ class ContactService {
 
     return allLinkedContacts;
   }
-
+  
+  // FIX: Added null checks to satisfy TypeScript
   private buildResponse(contacts: Contact[]): IdentifyResponse {
     if (contacts.length === 0) {
-      throw new Error('No contacts found');
+      throw new Error('Cannot build response with no contacts.');
     }
 
-    const primaryContact = contacts.find(c => c.linkPrecedence === 'primary');
-    const secondaryContacts = contacts.filter(c => c.linkPrecedence === 'secondary');
+    const primaryContact = contacts.find(c => c.linkPrecedence === 'primary') || contacts[0];
+    const secondaryContacts = contacts.filter(c => c.id !== primaryContact.id);
 
-    const emails = Array.from(new Set(
-      contacts.filter(c => c.email).map(c => c.email!)
-    ));
-    
-    const phoneNumbers = Array.from(new Set(
-      contacts.filter(c => c.phoneNumber).map(c => c.phoneNumber!)
-    ));
-
-    // Ensure primary contact's email and phone are first
-    if (primaryContact?.email) {
-      emails.unshift(primaryContact.email);
-    }
-    if (primaryContact?.phoneNumber) {
-      phoneNumbers.unshift(primaryContact.phoneNumber);
-    }
-
-    // Remove duplicates while preserving order
-    const uniqueEmails = [...new Set(emails)];
-    const uniquePhoneNumbers = [...new Set(phoneNumbers)];
+    const emails = Array.from(new Set(contacts.map(c => c.email).filter(Boolean))) as string[];
+    const phoneNumbers = Array.from(new Set(contacts.map(c => c.phoneNumber).filter(Boolean))) as string[];
+    const secondaryContactIds = secondaryContacts.map(c => c.id);
 
     return {
       contact: {
-        primaryContatctId: primaryContact!.id,
-        emails: uniqueEmails,
-        phoneNumbers: uniquePhoneNumbers,
-        secondaryContactIds: secondaryContacts.map(c => c.id)
+        primaryContatctId: primaryContact.id,
+        emails,
+        phoneNumbers,
+        secondaryContactIds
       }
     };
   }
