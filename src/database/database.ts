@@ -1,13 +1,30 @@
 import sqlite3 from 'sqlite3';
 import { promisify } from 'util';
 import path from 'path';
+import fs from 'fs'; // Import the file system module
 
 class Database {
   private db: sqlite3.Database;
 
   constructor() {
-    const dbPath = path.join(__dirname, '../../data/contacts.db');
-    this.db = new sqlite3.Database(dbPath);
+    // Define a path to a writable directory.
+    // On many platforms, '/var/data' is a standard for persistent storage.
+    const dataDir = path.join(__dirname, '../../../data'); // Go up from /dist/database/database.ts
+
+    // Ensure the data directory exists before trying to create the DB file.
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    const dbPath = path.join(dataDir, 'contacts.db');
+    console.log(`Initializing database at: ${dbPath}`);
+
+    this.db = new sqlite3.Database(dbPath, (err) => {
+        if (err) {
+            console.error('Error opening database:', err.message);
+        }
+    });
+    
     this.initializeDatabase();
   }
 
@@ -19,8 +36,8 @@ class Database {
         email TEXT,
         linkedId INTEGER,
         linkPrecedence TEXT NOT NULL CHECK (linkPrecedence IN ('primary', 'secondary')),
-        createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        createdAt DATETIME NOT NULL,
+        updatedAt DATETIME NOT NULL,
         deletedAt DATETIME,
         FOREIGN KEY (linkedId) REFERENCES Contact(id)
       )
@@ -30,7 +47,7 @@ class Database {
       if (err) {
         console.error('Error creating table:', err);
       } else {
-        console.log('Database initialized successfully');
+        console.log('Database table checked/created successfully.');
       }
     });
   }
